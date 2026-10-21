@@ -1,0 +1,196 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.10,<3.13"
+# dependencies = [
+#   "faster-whisper>=1.1",
+#   "av<16",
+#   "nvidia-cublas-cu12",
+#   "nvidia-cudnn-cu12>=9,<10",
+# ]
+# ///
+"""yt-transcript: transcreve videos do YouTube (ou arquivos locais) localmente.
+
+Uso:
+  yt-transcript URL                      # transcreve com Whisper na GPU, imprime texto
+  yt-transcript URL -o saida.txt         # salva em arquivo
+  yt-transcript URL --subs               # usa legenda do YouTube (rapido, sem Whisper)
+  yt-transcript URL --format srt         # gera SRT com timestamps
+  yt-transcript video.mp4 --lang pt      # arquivo local, forca idioma
+"""
+
+import argparse
+import ctypes
+import glob
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+def log(msg):
+    print(f"[yt-transcript] {msg}", file=sys.stderr, flush=True)
+
+
+def preload_cuda_libs():
+    # ctranslate2 precisa de cuBLAS/cuDNN do CUDA 12; carrega as libs dos wheels nvidia-*
+    try:
+        import nvidia
+    except ImportError:
+        return
+    for base in nvidia.__path__:
+        for pattern in ("cublas/lib/libcublasLt.so.*", "cublas/lib/libcublas.so.*", "cudnn/lib/libcudnn*.so.*"):
+            for lib in sorted(glob.glob(os.path.join(base, pattern))):
+                try:
+                    ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
+
+
+def fmt_ts(seconds, sep=","):
+    ms = int(round(seconds * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms:03d}"
+
+
+def render(segments, fmt):
+    """segments: lista de (inicio, fim, texto)."""
+    if fmt == "txt":
+        return "\n".join(t for _, _, t in segments) + "\n"
+    if fmt == "ts":
+        return "\n".join(f"[{fmt_ts(a, '.')[:8]}] {t}" for a, _, t in segments) + "\n"
+    if fmt == "srt":
+        out = []
+        for i, (a, b, t) in enumerate(segments, 1):
+            out.append(f"{i}\n{fmt_ts(a)} --> {fmt_ts(b)}\n{t}\n")
+        return "\n".join(out)
+    if fmt == "vtt":
+        out = ["WEBVTT\n"]
+        for a, b, t in segments:
+            out.append(f"{fmt_ts(a, '.')} --> {fmt_ts(b, '.')}\n{t}\n")
+        return "\n".join(out)
+    raise ValueError(fmt)
+
+
+# ---------------------------------------------------------------- legendas do YouTube
+
+def parse_vtt(path):
+    def secs(ts):
+        parts = ts.replace(",", ".").split(":")
+        parts = [0.0] * (3 - len(parts)) + [float(p) for p in parts]
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+    segments, seen = [], set()
+    blocks = re.split(r"\n\s*\n", Path(path).read_text(encoding="utf-8", errors="replace"))
+    for block in blocks:
+        m = re.search(r"([\d:.]+)\s+-->\s+([\d:.]+)[^\n]*", block)
+        if not m:
+            continue
+        lines = block[m.end():].strip().splitlines()
+        for line in lines:
+            text = re.sub(r"<[^>]+>", "", line).strip()
+            text = re.sub(r"\s+", " ", text)
+            # legendas automaticas repetem a linha anterior em "rolagem"; descarta duplicadas
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            segments.append((secs(m.group(1)), secs(m.group(2)), text))
+    return segments
+
+
+def fetch_subs(url, lang, workdir):
+    langs = f"{lang}-orig,{lang},{lang}-BR" if lang else "pt-orig,pt,pt-BR,en-orig,en"
+    base = ["yt-dlp", "--skip-download", "--sub-format", "vtt", "--sub-langs", langs,
+            "-o", str(workdir / "subs.%(ext)s"), "--no-warnings", "-q"]
+    for flag, label in (("--write-subs", "manual"), ("--write-auto-subs", "automatica")):
+        subprocess.run(base + [flag, url], check=False)
+        files = sorted(workdir.glob("subs*.vtt"))
+        if files:
+            log(f"usando legenda {label} do YouTube: {files[0].name}")
+            return parse_vtt(files[0])
+    return None
+
+
+# ---------------------------------------------------------------- whisper local
+
+def download_audio(url, workdir):
+    log("baixando audio...")
+    out = workdir / "audio.%(ext)s"
+    subprocess.run(["yt-dlp", "-f", "bestaudio/best", "-x", "--audio-format", "m4a",
+                    "-o", str(out), "--no-warnings", "-q", "--no-playlist", url], check=True)
+    files = list(workdir.glob("audio.*"))
+    if not files:
+        sys.exit("falha ao baixar o audio")
+    return files[0]
+
+
+def transcribe(audio, model_name, lang, device):
+    preload_cuda_libs()
+    from faster_whisper import WhisperModel
+
+    attempts = [("cuda", "float16"), ("cpu", "int8")] if device == "auto" else \
+        [(device, "float16" if device == "cuda" else "int8")]
+    last_err = None
+    for dev, ctype in attempts:
+        try:
+            log(f"carregando modelo {model_name} ({dev}/{ctype})...")
+            model = WhisperModel(model_name, device=dev, compute_type=ctype)
+            segs, info = model.transcribe(str(audio), language=lang, vad_filter=True, beam_size=5)
+            log(f"idioma: {info.language} ({info.language_probability:.0%}), duracao: {fmt_ts(info.duration, '.')[:8]}")
+            result = []
+            for s in segs:
+                result.append((s.start, s.end, s.text.strip()))
+                pct = min(100, s.end / info.duration * 100) if info.duration else 0
+                print(f"\r[yt-transcript] transcrevendo... {pct:5.1f}%", end="", file=sys.stderr, flush=True)
+            print(file=sys.stderr)
+            return result
+        except Exception as e:  # GPU indisponivel / lib faltando -> tenta CPU
+            last_err = e
+            log(f"falhou em {dev}: {e}")
+    sys.exit(f"erro na transcricao: {last_err}")
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    p = argparse.ArgumentParser(description="Transcreve videos do YouTube (ou arquivos locais) localmente.")
+    p.add_argument("source", help="URL do YouTube ou caminho de arquivo de audio/video")
+    p.add_argument("-o", "--output", help="arquivo de saida (padrao: stdout)")
+    p.add_argument("-f", "--format", choices=["txt", "ts", "srt", "vtt"], default="txt",
+                   help="txt (texto puro), ts (com [hh:mm:ss]), srt, vtt")
+    p.add_argument("-l", "--lang", help="idioma (ex: pt, en). Padrao: deteccao automatica")
+    p.add_argument("-m", "--model", default="large-v3-turbo",
+                   help="modelo Whisper: tiny, base, small, medium, large-v3, large-v3-turbo (padrao)")
+    p.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    p.add_argument("--subs", action="store_true",
+                   help="usa legendas do YouTube (manual > automatica); cai para Whisper se nao houver")
+    a = p.parse_args()
+
+    with tempfile.TemporaryDirectory(prefix="yt-transcript-") as tmp:
+        workdir = Path(tmp)
+        local = Path(a.source).expanduser()
+        segments = None
+        if local.exists():
+            audio = local
+        else:
+            if a.subs:
+                segments = fetch_subs(a.source, a.lang, workdir)
+                if not segments:
+                    log("sem legendas no YouTube, usando Whisper")
+            audio = None if segments else download_audio(a.source, workdir)
+        if segments is None:
+            segments = transcribe(audio, a.model, a.lang, a.device)
+
+        text = render(segments, a.format)
+        if a.output:
+            Path(a.output).write_text(text, encoding="utf-8")
+            log(f"salvo em {a.output}")
+        else:
+            sys.stdout.write(text)
+
+
+if __name__ == "__main__":
+    main()

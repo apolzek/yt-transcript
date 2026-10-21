@@ -1,0 +1,7 @@
+*.txt
+*.srt
+*.vtt
+*.m4a
+*.mp3
+*.mp4
+__pycache__/
