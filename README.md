@@ -1,5 +1,7 @@
 # yt-transcript
 
+[![tests](https://github.com/apolzek/yt-transcript/actions/workflows/tests.yml/badge.svg)](https://github.com/apolzek/yt-transcript/actions/workflows/tests.yml)
+
 Transcreve vídeos do YouTube (ou arquivos de áudio/vídeo locais) **localmente**:
 o áudio é baixado com [yt-dlp](https://github.com/yt-dlp/yt-dlp) e transcrito na
 sua máquina com [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
@@ -51,6 +53,15 @@ yt-transcript URL | wc -w
 ## Desempenho
 
 Vídeo de 32 min em português: ~1 min numa RTX 4070 Ti SUPER com `large-v3-turbo`.
+
+## Testes
+
+```bash
+uv run --no-project --python 3.12 --with pytest pytest -v
+```
+
+Os testes não precisam de rede, GPU nem do modelo Whisper: `yt-dlp` e a transcrição
+são substituídos por mocks. Rodam no GitHub Actions em Python 3.10, 3.11 e 3.12.
 
 ## Licença
 
